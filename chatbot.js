@@ -22,6 +22,9 @@ const DISCORD_URL = process.env.DISCORD_URL;
 const X_URL = process.env.X_URL;
 const TIKTOK_URL = process.env.TIKTOK_URL;
 
+const PROMPT_PROFILE = process.env.PROMPT_PROFILE;
+const PROMPT_NEGATIVE = process.env.PROMPT_NEGATIVE;
+
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
   });
@@ -31,7 +34,7 @@ let websocketSessionId;
 // Start the bot
 (async () => {
     await validateToken(); // Validate the OAuth token
-    startWebSocketConnection(); // // Start the WebSocket connection
+    startWebSocketConnection(); // Start the WebSocket connection
 })();
 
 // Validate the OAuth token
@@ -107,6 +110,16 @@ function startWebSocketConnection() {
 
     ws.on('close', () => {
         console.log('WebSocket connection closed.');
+        // Essayer de se reconnecter après un délai
+        setTimeout(() => {
+            console.log('Attempting to reconnect...');
+            startWebSocketConnection();  // Reconnexion automatique
+        }, 5000); // Attendre 5 secondes avant de tenter une reconnexion
+    });
+
+    // Ajouter un gestionnaire pour les pongs
+    ws.on('pong', () => {
+        console.log('Pong received.');
     });
 }
 
@@ -116,6 +129,17 @@ async function handleWebSocketMessage(message) {
         case 'session_welcome':
             websocketSessionId = message.payload.session.id;
             subscribeToChatEvents(); // Subscribe to chat events
+            break;
+
+        case 'session_reconnect':
+            const reconnectUrl = message.payload.session.reconnect_url;
+            console.log('Session reconnect requested. Reconnecting...');
+            ws.close(); // Fermer la connexion actuelle
+            startWebSocketConnection(reconnectUrl); // Reconnecter à l'URL fournie
+            break;
+        
+        case 'keepalive':
+            console.log('Keepalive received, connection is healthy.');
             break;
 
         case 'notification':
@@ -198,6 +222,9 @@ async function handleBotCommand(question, sender) {
     } else if (isSocialMediaQuestion(question)) {
         const response = await askOpenAIAboutSocials(question);
         sendChatMessage(response);
+    } else if (isSubscriptionQuestion(question)) {
+        const response = await askOpenAIAboutSubscription(question);
+        sendChatMessage(response);
     } else {
         const response = await getOpenAIResponse(question);
         sendChatMessage(response);
@@ -207,9 +234,14 @@ async function handleBotCommand(question, sender) {
 // Function to get a response from OpenAI
 async function getOpenAIResponse(question) {
     try {
+        const prompt = `${PROMPT_PROFILE}
+        ${PROMPT_NEGATIVE}
+        Voici la question du viewer: 
+        ${question}`;
+
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
-            messages: [{ role: 'user', content: question }],
+            messages: [{ role: 'user', content: prompt }],
         });
 
         return response.choices[0].message.content;
@@ -232,9 +264,9 @@ async function getTwitchSchedule() {
 }
 
 async function askOpenAIAboutSchedule(question, schedule) {
-    const prompt = `Voici les horaires de streaming:
+    const prompt = `${PROMPT_PROFILE}
+    Voici les horaires de streaming, tu dois convertir les heures en GMT+1:
     ${JSON.stringify(schedule)}
-    Tu es l'assistant au viewer twitch de la chaïne. Utilise uniquement du texte brut, pas de format Markdown.
     Réponds à cette question à propos du planning en te basant sur ces informations:
     ${question}`;
 
@@ -253,8 +285,8 @@ function isStreamQuestion(message) {
 }
 
 async function askOpenAIAboutSocials(question) {
-    const prompt = `Tu es un assistant de chat Twitch. Réponds de manière appropriée en fonction de la demande, en utilisant les informations ci-dessus.
-    Utilise uniquement du texte brut, pas de format Markdown (pas de liens cliquables avec []()). Voici les liens vers les réseaux sociaux de la chaine:
+    const prompt = `${PROMPT_PROFILE}
+    Voici les liens vers les réseaux sociaux de la chaine:
     Instagram: ${INSTAGRAM_URL}
     YouTube: ${YOUTUBE_URL}
     VOD: ${VOD_URL}
@@ -276,4 +308,32 @@ async function askOpenAIAboutSocials(question) {
 function isSocialMediaQuestion(message) {
     const socialKeywords = ['instagram', 'youtube', 'réseaux sociaux', 'page instagram', 'page youtube', 'insta', 'vod', 'ytb', 'chaine'];
     return socialKeywords.some(keyword => message.toLowerCase().includes(keyword));
+}
+
+// Fonction pour interroger OpenAI à propos des abonnements
+async function askOpenAIAboutSubscription(question) {
+    const prompt = `${PROMPT_PROFILE}  
+    Voici la question à propos de l'abonnement :  
+    ${question}
+
+    Essaie de convaincre en quelques mots pourquoi s'abonner à la chaîne. Mentionne les avantages suivants sans en rajouter ni faire de supposition :
+    - De nouveaux emojis exclusifs.
+    - Moins de publicités pendant les streams.
+    - Un soutien direct à la chaîne et au créateur de contenu.
+
+    Sois persuasif et donne une réponse convaincante !`;
+
+    const openaiResponse = await openai.chat.completions.create({
+        model: 'gpt-4-mini', // Ou un autre modèle si nécessaire
+        messages: [{ role: 'user', content: prompt }],
+    });
+
+    return openaiResponse.choices[0].message.content.trim();
+}
+
+// Fonction pour vérifier si le message contient une question sur l'abonnement
+function isSubscriptionQuestion(message) {
+    // Regex pour vérifier des phrases comme "pourquoi s'abonner", "bénéfices du sub", etc.
+    const regex = /(\bpourquoi\b.*\b(s'abonner|s'abonne|subscribe)\b|\b(avantages?|bénéfices?)\b.*\b(s'abonnement|sub)\b|\b(c'est|c\'est)\b.*\b(un sub|abonné|abonnement)\b)/i;
+    return regex.test(message);  // Utilise .test() pour tester le message
 }
