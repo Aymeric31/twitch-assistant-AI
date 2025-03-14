@@ -1,6 +1,0 @@
-generate_token.py
-server.js
-node_modules/
-package-lock.json
-package.json
-.env
