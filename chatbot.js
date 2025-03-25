@@ -25,6 +25,10 @@ const TIKTOK_URL = process.env.TIKTOK_URL;
 const PROMPT_PROFILE = process.env.PROMPT_PROFILE;
 const PROMPT_NEGATIVE = process.env.PROMPT_NEGATIVE;
 
+// Charger les mots négatifs depuis le JSON
+const pejorativeWords = JSON.parse(fs.readFileSync('pejorative_words.json', 'utf-8')).pejorative_words;
+const pejorativeRegex = new RegExp(`\\b(${pejorativeWords.map(word => word.trim().replace(/\s+/g, '\\s*')).join('|')})\\b`, 'i');
+
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
   });
@@ -110,11 +114,11 @@ function startWebSocketConnection() {
 
     ws.on('close', () => {
         console.log('WebSocket connection closed.');
-        // Essayer de se reconnecter après un délai
+        // Try to reconnect
         setTimeout(() => {
             console.log('Attempting to reconnect...');
-            startWebSocketConnection();  // Reconnexion automatique
-        }, 5000); // Attendre 5 secondes avant de tenter une reconnexion
+            startWebSocketConnection();  // Auto reconnect
+        }, 5000); // Wait 5 sec
     });
 
     // Ajouter un gestionnaire pour les pongs
@@ -134,8 +138,8 @@ async function handleWebSocketMessage(message) {
         case 'session_reconnect':
             const reconnectUrl = message.payload.session.reconnect_url;
             console.log('Session reconnect requested. Reconnecting...');
-            ws.close(); // Fermer la connexion actuelle
-            startWebSocketConnection(reconnectUrl); // Reconnecter à l'URL fournie
+            ws.close();
+            startWebSocketConnection(reconnectUrl);
             break;
         
         case 'keepalive':
@@ -146,10 +150,11 @@ async function handleWebSocketMessage(message) {
             if (message.metadata.subscription_type === 'channel.chat.message') {
                 const chatMessage = message.payload.event.message.text;
                 const sender = message.payload.event.chatter_user_login;
+                const messageId = message.payload.event.message_id; // Récupération de l'ID du message
 
                 if (chatMessage.startsWith('!brigadier')) {
                     const question = chatMessage.replace('!brigadier', '').trim();
-                    handleBotCommand(question, sender);
+                    handleBotCommand(question, sender, messageId);
                 }
             }
             break;
@@ -192,7 +197,19 @@ async function subscribeToChatEvents() {
 }
 
 // Send a message to the chat
-async function sendChatMessage(message) {
+async function sendChatMessage(message, messageId=null) {
+    const body = {
+        broadcaster_id: BROADCASTER_ID,
+        sender_id: BROADCASTER_ID, // The ID of the user sending the message
+        message: message,
+    };
+
+    // If replying to a specific message, add the parent message ID
+    if (messageId) {
+        console.log(body.reply_parent_message_id = messageId);
+        body.reply_parent_message_id = messageId;
+    }
+
     const response = await fetch('https://api.twitch.tv/helix/chat/messages', {
         method: 'POST',
         headers: {
@@ -200,11 +217,7 @@ async function sendChatMessage(message) {
             'Client-Id': CLIENT_ID,
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-            broadcaster_id: BROADCASTER_ID,
-            sender_id: BROADCASTER_ID, // The ID of the user sending the message
-            message: message,
-        }),
+        body: JSON.stringify(body),
     });
 
     if (!response.ok) {
@@ -214,20 +227,24 @@ async function sendChatMessage(message) {
     }
 }
 
-async function handleBotCommand(question, sender) {
-    if (isStreamQuestion(question)) {
+async function handleBotCommand(question, sender, messageId) {
+    let response;
+    if (pejorativeRegex.test(question)) {
+        response = await getOpenAIResponse(question);
+        sendChatMessage(response, messageId);
+    } else if (isStreamQuestion(question)) {
         const schedule = await getTwitchSchedule();
-        const response = await askOpenAIAboutSchedule(question, schedule);
-        sendChatMessage(response);
+        response = await askOpenAIAboutSchedule(question, schedule);
+        sendChatMessage(response, messageId);
     } else if (isSocialMediaQuestion(question)) {
-        const response = await askOpenAIAboutSocials(question);
-        sendChatMessage(response);
+        response = await askOpenAIAboutSocials(question);
+        sendChatMessage(response, messageId);
     } else if (isSubscriptionQuestion(question)) {
-        const response = await askOpenAIAboutSubscription(question);
-        sendChatMessage(response);
+        response = await askOpenAIAboutSubscription(question);
+        sendChatMessage(response, messageId);
     } else {
-        const response = await getOpenAIResponse(question);
-        sendChatMessage(response);
+        response = await getOpenAIResponse(question);
+        sendChatMessage(response, messageId);
     }
 }
 
@@ -280,8 +297,9 @@ async function askOpenAIAboutSchedule(question, schedule) {
 
 // Check if a message contains a question about the schedule or stream
 function isStreamQuestion(message) {
-    const keywords = ['prochain stream', 'quand', 'heure', 'jeu', 'planning', 'stream', 'à quelle heure'];
-    return keywords.some(keyword => message.toLowerCase().includes(keyword));
+    const regex = /(proch(a|ai)n|quand|heure|jeu[x]?|plann?ing|stream|à quelle heure|live)/i;
+
+    return regex.test(message);
 }
 
 async function askOpenAIAboutSocials(question) {
@@ -310,7 +328,7 @@ function isSocialMediaQuestion(message) {
     return socialKeywords.some(keyword => message.toLowerCase().includes(keyword));
 }
 
-// Fonction pour interroger OpenAI à propos des abonnements
+// Function to ask OpenAI about subscriptions
 async function askOpenAIAboutSubscription(question) {
     const prompt = `${PROMPT_PROFILE}  
     Voici la question à propos de l'abonnement :  
@@ -324,16 +342,16 @@ async function askOpenAIAboutSubscription(question) {
     Sois persuasif et donne une réponse convaincante !`;
 
     const openaiResponse = await openai.chat.completions.create({
-        model: 'gpt-4-mini', // Ou un autre modèle si nécessaire
+        model: 'gpt-4-mini',
         messages: [{ role: 'user', content: prompt }],
     });
 
     return openaiResponse.choices[0].message.content.trim();
 }
 
-// Fonction pour vérifier si le message contient une question sur l'abonnement
+// Function to check if the message contains a question about subscriptions
 function isSubscriptionQuestion(message) {
-    // Regex pour vérifier des phrases comme "pourquoi s'abonner", "bénéfices du sub", etc.
+    // Regex to check for phrases like "why subscribe", "subscription benefits", etc.
     const regex = /(\bpourquoi\b.*\b(s'abonner|s'abonne|subscribe)\b|\b(avantages?|bénéfices?)\b.*\b(s'abonnement|sub)\b|\b(c'est|c\'est)\b.*\b(un sub|abonné|abonnement)\b)/i;
-    return regex.test(message);  // Utilise .test() pour tester le message
+    return regex.test(message);  // Uses .test() to check the message
 }
