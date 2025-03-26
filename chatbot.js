@@ -3,6 +3,7 @@ import fetch from 'node-fetch';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import * as fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -22,12 +23,12 @@ const DISCORD_URL = process.env.DISCORD_URL;
 const X_URL = process.env.X_URL;
 const TIKTOK_URL = process.env.TIKTOK_URL;
 
-const PROMPT_PROFILE = process.env.PROMPT_PROFILE;
-const PROMPT_NEGATIVE = process.env.PROMPT_NEGATIVE;
-
 // Charger les mots négatifs depuis le JSON
 const pejorativeWords = JSON.parse(fs.readFileSync('pejorative_words.json', 'utf-8')).pejorative_words;
 const pejorativeRegex = new RegExp(`\\b(${pejorativeWords.map(word => word.trim().replace(/\s+/g, '\\s*')).join('|')})\\b`, 'i');
+
+// List of prompts for openAI
+const prompts = JSON.parse(fs.readFileSync('prompts.json', 'utf-8'));
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -127,6 +128,29 @@ function startWebSocketConnection() {
     });
 }
 
+// Function to get the file name based on the current date
+function getLogFileName() {
+    const date = new Date().toLocaleDateString('fr-FR').split('/').join('-'); // Format DD-MM-YYYY
+    return path.join('logs', `${date}.txt`); // Store logs in a "logs" folder
+}
+
+// Function to add a log entry to logs.txt
+function logMessage(user, message, response) {
+    const timestamp = new Date().toLocaleString(); // Readable format
+    const logEntry = `[${timestamp}] ${user}: ${message} \nBOT: ${response}\n\n`;
+
+    // Get the file for the current day
+    const logFile = getLogFileName();
+
+    // Ensure the "logs" folder exists
+    if (!fs.existsSync('logs')) {
+        fs.mkdirSync('logs');
+    }    
+
+    // Add the log entry to the file for the current day
+    fs.appendFileSync(logFile, logEntry, 'utf8');
+}
+
 // Handle WebSocket messages
 async function handleWebSocketMessage(message) {
     switch (message.metadata.message_type) {
@@ -148,9 +172,9 @@ async function handleWebSocketMessage(message) {
 
         case 'notification':
             if (message.metadata.subscription_type === 'channel.chat.message') {
-                const chatMessage = message.payload.event.message.text;
-                const sender = message.payload.event.chatter_user_login;
-                const messageId = message.payload.event.message_id; // Récupération de l'ID du message
+                const chatMessage = message.payload.event.message.text;// Retrieve the chat message
+                const sender = message.payload.event.chatter_user_login; // Retrieve the sender's username
+                const messageId = message.payload.event.message_id; // Retrieve the message ID
 
                 if (chatMessage.startsWith('!brigadier')) {
                     const question = chatMessage.replace('!brigadier', '').trim();
@@ -206,7 +230,6 @@ async function sendChatMessage(message, messageId=null) {
 
     // If replying to a specific message, add the parent message ID
     if (messageId) {
-        console.log(body.reply_parent_message_id = messageId);
         body.reply_parent_message_id = messageId;
     }
 
@@ -228,44 +251,58 @@ async function sendChatMessage(message, messageId=null) {
 }
 
 async function handleBotCommand(question, sender, messageId) {
+    // Checks if the message is empty or contains 3 characters or less
+    if (!question || question.trim().length <= 3) {
+        const fallbackResponse = "Tu devrais poser une question plus complète ! 😊";
+        sendChatMessage(fallbackResponse, messageId);
+        logMessage(sender, question, fallbackResponse);
+        return;
+    }
+
     let response;
-    if (pejorativeRegex.test(question)) {
-        response = await getOpenAIResponse(question);
+
+    try {
+        if (pejorativeRegex.test(question)) {
+            response = await getOpenAIResponse(question);
+        } else if (isStreamQuestion(question)) {
+            const schedule = await getTwitchSchedule();
+            response = await askOpenAIAboutSchedule(question, schedule);
+        } else if (isChonchQuestion(question)) {
+            response = await askOpenAIAboutChonch(question);
+        } else if (isSocialMediaQuestion(question)) {
+            response = await askOpenAIAboutSocials(question);
+        } else if (isSubscriptionQuestion(question)) {
+            response = await askOpenAIAboutSubscription(question);
+        } else {
+            response = await getOpenAIResponse(question);
+        }
+
         sendChatMessage(response, messageId);
-    } else if (isStreamQuestion(question)) {
-        const schedule = await getTwitchSchedule();
-        response = await askOpenAIAboutSchedule(question, schedule);
-        sendChatMessage(response, messageId);
-    } else if (isSocialMediaQuestion(question)) {
-        response = await askOpenAIAboutSocials(question);
-        sendChatMessage(response, messageId);
-    } else if (isSubscriptionQuestion(question)) {
-        response = await askOpenAIAboutSubscription(question);
-        sendChatMessage(response, messageId);
-    } else {
-        response = await getOpenAIResponse(question);
-        sendChatMessage(response, messageId);
+        logMessage(sender, question, response);
+
+    } catch (error) {
+        console.error("Error in handleBotCommand:", error);
+        
+        const errorResponse = "Je n'arrive pas à répondre à la question pour le moment. 😕";
+        sendChatMessage(errorResponse, messageId);
+        
+        logMessage(sender, question, errorResponse + " | Error: " + error.message);
     }
 }
 
 // Function to get a response from OpenAI
 async function getOpenAIResponse(question) {
-    try {
-        const prompt = `${PROMPT_PROFILE}
-        ${PROMPT_NEGATIVE}
-        Voici la question du viewer: 
-        ${question}`;
+    const prompt = `${prompts.profile}
+    ${prompts.negative}
+    Voici la question du viewer: 
+    ${question}`;
 
-        const response = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [{ role: 'user', content: prompt }],
-        });
+    const response = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+    });
 
-        return response.choices[0].message.content;
-    } catch (error) {
-        console.error('Error when asking OpenAI:', error);
-        return 'Désolé, je n\'ai pas été formé pour répondre à cette question';
-    }
+    return response.choices[0].message.content;
 }
 
 async function getTwitchSchedule() {
@@ -281,7 +318,7 @@ async function getTwitchSchedule() {
 }
 
 async function askOpenAIAboutSchedule(question, schedule) {
-    const prompt = `${PROMPT_PROFILE}
+    const prompt = `${prompts.profile}
     Voici les horaires de streaming, tu dois convertir les heures en GMT+1:
     ${JSON.stringify(schedule)}
     Réponds à cette question à propos du planning en te basant sur ces informations:
@@ -303,7 +340,7 @@ function isStreamQuestion(message) {
 }
 
 async function askOpenAIAboutSocials(question) {
-    const prompt = `${PROMPT_PROFILE}
+    const prompt = `${prompts.profile}
     Voici les liens vers les réseaux sociaux de la chaine:
     Instagram: ${INSTAGRAM_URL}
     YouTube: ${YOUTUBE_URL}
@@ -330,7 +367,7 @@ function isSocialMediaQuestion(message) {
 
 // Function to ask OpenAI about subscriptions
 async function askOpenAIAboutSubscription(question) {
-    const prompt = `${PROMPT_PROFILE}  
+    const prompt = `${prompts.profile} 
     Voici la question à propos de l'abonnement :  
     ${question}
 
@@ -342,7 +379,7 @@ async function askOpenAIAboutSubscription(question) {
     Sois persuasif et donne une réponse convaincante !`;
 
     const openaiResponse = await openai.chat.completions.create({
-        model: 'gpt-4-mini',
+        model: 'gpt-4o-mini',
         messages: [{ role: 'user', content: prompt }],
     });
 
@@ -354,4 +391,24 @@ function isSubscriptionQuestion(message) {
     // Regex to check for phrases like "why subscribe", "subscription benefits", etc.
     const regex = /(\bpourquoi\b.*\b(s'abonner|s'abonne|subscribe)\b|\b(avantages?|bénéfices?)\b.*\b(s'abonnement|sub)\b|\b(c'est|c\'est)\b.*\b(un sub|abonné|abonnement)\b)/i;
     return regex.test(message);  // Uses .test() to check the message
+}
+
+// Function to ask OpenAI about chonch
+async function askOpenAIAboutChonch(question) {
+    const prompt = `${prompts.profile}
+    ${prompts.chonch}
+    Voici la question à propos du chonch :  
+    ${question}`;
+
+    const openaiResponse = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+    });
+
+    return openaiResponse.choices[0].message.content.trim();
+}
+
+// Function to check if the message contains "chonch"
+function isChonchQuestion(message) {
+    return message.toLowerCase().includes("chonch");
 }
