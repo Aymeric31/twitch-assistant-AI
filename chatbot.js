@@ -34,6 +34,7 @@ const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
   });
 
+let ws; // WebSocket instance
 let websocketSessionId;
 
 // Start the bot
@@ -97,8 +98,8 @@ async function refreshAccessToken() {
 }
 
 // Start the WebSocket connection
-function startWebSocketConnection() {
-    const ws = new WebSocket(EVENTSUB_WEBSOCKET_URL);
+function startWebSocketConnection(url = EVENTSUB_WEBSOCKET_URL) {
+    ws = new WebSocket(url);
 
     ws.on('open', () => {
         console.log('WebSocket connection established.');
@@ -162,7 +163,9 @@ async function handleWebSocketMessage(message) {
         case 'session_reconnect':
             const reconnectUrl = message.payload.session.reconnect_url;
             console.log('Session reconnect requested. Reconnecting...');
-            ws.close();
+            if (ws) {
+                ws.close(); // Close the current WebSocket connection
+            }
             startWebSocketConnection(reconnectUrl);
             break;
         
@@ -179,6 +182,9 @@ async function handleWebSocketMessage(message) {
                 if (chatMessage.startsWith('!brigadier')) {
                     const question = chatMessage.replace('!brigadier', '').trim();
                     handleBotCommand(question, sender, messageId);
+                } else if (chatMessage.trim() === '!titre') { // Check for the "!titre" command
+                    const streamTitle = await getStreamTitle(); // Fetch the stream title
+                    sendChatMessage(`Titre du stream : ${streamTitle}`, messageId); // Send the title as a response
                 }
             }
             break;
@@ -220,8 +226,18 @@ async function subscribeToChatEvents() {
     }
 }
 
+function truncateMessage(message, maxLength = 500) {
+    if (message.length <= maxLength) {
+        return message;
+    }
+    // Tronquer proprement à la dernière phrase ou mot complet
+    return message.slice(0, maxLength).trim() + '...';
+}
+
 // Send a message to the chat
 async function sendChatMessage(message, messageId=null) {
+// Tronquer le message à 500 caractères
+    message = truncateMessage(message);
     const body = {
         broadcaster_id: BROADCASTER_ID,
         sender_id: BROADCASTER_ID, // The ID of the user sending the message
@@ -273,6 +289,9 @@ async function handleBotCommand(question, sender, messageId) {
             response = await askOpenAIAboutSocials(question);
         } else if (isSubscriptionQuestion(question)) {
             response = await askOpenAIAboutSubscription(question);
+        } else if (isTopClipsQuestion(question)) {
+            const clipsInfo = await getTopClips();
+            response = await askOpenAIAboutClips(question, clipsInfo);
         } else {
             response = await getOpenAIResponse(question);
         }
@@ -287,6 +306,34 @@ async function handleBotCommand(question, sender, messageId) {
         sendChatMessage(errorResponse, messageId);
         
         logMessage(sender, question, errorResponse + " | Error: " + error.message);
+    }
+}
+
+// Function to get the current stream title
+async function getStreamTitle() {
+    try {
+        const response = await fetch(`https://api.twitch.tv/helix/streams?user_id=${BROADCASTER_ID}`, {
+            headers: {
+                'Authorization': `Bearer ${OAUTH_TOKEN}`,
+                'Client-Id': CLIENT_ID,
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch stream title: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const stream = data.data[0]; // The first item contains the stream info
+
+        if (stream) {
+            return stream.title; // Return the stream title
+        } else {
+            return "Le stream est actuellement hors ligne."; // Message if the stream is offline
+        }
+    } catch (error) {
+        console.error("Error fetching stream title:", error);
+        return "Impossible de récupérer le titre du stream pour le moment.";
     }
 }
 
@@ -411,4 +458,84 @@ async function askOpenAIAboutChonch(question) {
 // Function to check if the message contains "chonch"
 function isChonchQuestion(message) {
     return message.toLowerCase().includes("chonch");
+}
+
+// Function to get the top 3 clips of the channel
+async function getTopClips() {
+    try {
+        const response = await fetch(`https://api.twitch.tv/helix/clips?broadcaster_id=${BROADCASTER_ID}&first=3`, {
+            headers: {
+                'Authorization': `Bearer ${OAUTH_TOKEN}`,
+                'Client-Id': CLIENT_ID,
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch clips: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        const clips = data.data; // Array of clips
+
+        if (clips.length === 0) {
+            return "Aucun clip n'a été trouvé pour cette chaîne.";
+        }
+
+        // Extract unique game IDs from the clips
+        const gameIds = [...new Set(clips.map(clip => clip.game_id))];
+
+        // Fetch game names for the game IDs
+        const gamesResponse = await fetch(`https://api.twitch.tv/helix/games?id=${gameIds.join('&id=')}`, {
+            headers: {
+                'Authorization': `Bearer ${OAUTH_TOKEN}`,
+                'Client-Id': CLIENT_ID,
+            },
+        });
+
+        if (!gamesResponse.ok) {
+            throw new Error(`Failed to fetch game names: ${gamesResponse.statusText}`);
+        }
+
+        const gamesData = await gamesResponse.json();
+        const gamesMap = gamesData.data.reduce((map, game) => {
+            map[game.id] = game.name; // Map game_id to game_name
+            return map;
+        }, {});
+
+        // Format the top 3 clips with game names
+        return clips.map(clip => ({
+            title: clip.title,
+            game: gamesMap[clip.game_id] || "Jeu inconnu", // Use the game name or fallback
+            url: clip.url,
+            views: clip.view_count,
+        }));
+    } catch (error) {
+        console.error("Error fetching top clips:", error);
+        return "Impossible de récupérer les clips pour le moment.";
+    }
+}
+
+// Function to ask OpenAI to format the top clips response
+async function askOpenAIAboutClips(question, clipsInfo) {
+    // console.log("openIA: " + JSON.stringify(clipsInfo, null, 2));
+    const prompt = `${prompts.profile}
+    Voici les 3 clips les plus populaires de la chaîne Twitch :
+    ${JSON.stringify(clipsInfo)}
+    Et voici la question de l'utilisateur:
+    ${question}`;
+
+    const openaiResponse = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [{ role: 'user', content: prompt }],
+    });
+    console.log(openaiResponse.choices[0].message.content.trim());
+    return openaiResponse.choices[0].message.content.trim();
+}
+
+// Function to check if the message contains a question about top clips
+function isTopClipsQuestion(message) {
+    // Regex to check for phrases like "top clips", "meilleurs clips", "clips populaires", etc.
+    const regex = /\b(donne moi|quel|top|meilleurs?|clips?|populaires?|le clip le plus|plus vues?|meilleur clip|clip le plus populaire)\b.*\b(clips?|vidéos?)?\b/i;
+    
+    return regex.test(message); // Uses .test() to check the message
 }
