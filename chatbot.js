@@ -7,9 +7,10 @@ import path from 'path';
 
 dotenv.config();
 
-let OAUTH_TOKEN = process.env.TWITCH_ACCESS_TOKEN;
-let REFRESH_TOKEN = process.env.TWITCH_REFRESH_TOKEN; 
-const CLIENT_ID = process.env.TWITCH_CLIENT_ID;
+let OAUTH_TOKEN = process.env.TWITCH_ACCESS_TOKEN_BOT;
+let REFRESH_TOKEN = process.env.TWITCH_REFRESH_TOKEN_BOT; 
+const CLIENT_ID = process.env.TWITCH_CLIENT_ID_BOT;
+const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET_BOT;
 
 const BROADCASTER_ID = process.env.TWITCH_BROADCASTER_ID; // Broadcaster ID (your channel)
 const EVENTSUB_WEBSOCKET_URL = 'wss://eventsub.wss.twitch.tv/ws';
@@ -37,10 +38,20 @@ const openai = new OpenAI({
 let ws; // WebSocket instance
 let websocketSessionId;
 
+const messageQueue = [];
+let isProcessingQueue = false;
+
+const userCooldowns = new Map();
+const userLastQuestions = new Map(); // Tracks the last question asked by each user
+const QUESTION_EXPIRATION_TIME = 60000; // Time in milliseconds (1 minute). Duration after which a user's last question is considered "expired."
+const COOLDOWN_TIME = 5000; // Cooldown time in milliseconds (5 seconds). Minimum delay required between messages from the same user to prevent spamming.
+const BOT_ANNOUNCEMENT_INTERVAL = 278000; // Interval in milliseconds (4 minutes and 38 seconds). Time between bot announcements in the chat.
+
 // Start the bot
 (async () => {
     await validateToken(); // Validate the OAuth token
     startWebSocketConnection(); // Start the WebSocket connection
+    startBotAnnouncement(); // Start sending periodic bot announcements
 })();
 
 // Validate the OAuth token
@@ -66,8 +77,8 @@ async function refreshAccessToken() {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({
-                client_id: process.env.CLIENT_ID,
-                client_secret: process.env.CLIENT_SECRET,
+                client_id: CLIENT_ID,
+                client_secret: CLIENT_SECRET,
                 grant_type: 'refresh_token',
                 refresh_token: REFRESH_TOKEN
             })
@@ -87,8 +98,8 @@ async function refreshAccessToken() {
         // Update the .env file
         let envContent = fs.readFileSync('.env', 'utf-8');
         envContent = envContent
-            .replace(/TWITCH_ACCESS_TOKEN=.*/, `TWITCH_ACCESS_TOKEN=${OAUTH_TOKEN}`)
-            .replace(/TWITCH_REFRESH_TOKEN=.*/, `TWITCH_REFRESH_TOKEN=${REFRESH_TOKEN}`);
+            .replace(/TWITCH_ACCESS_TOKEN_BOT=.*/, `TWITCH_ACCESS_TOKEN_BOT=${OAUTH_TOKEN}`)
+            .replace(/TWITCH_REFRESH_TOKEN_BOT=.*/, `TWITCH_REFRESH_TOKEN_BOT=${REFRESH_TOKEN}`);
         fs.writeFileSync('.env', envContent);
         console.log('.env updated');
     } catch (error) {
@@ -129,6 +140,19 @@ function startWebSocketConnection(url = EVENTSUB_WEBSOCKET_URL) {
     });
 }
 
+function startBotAnnouncement() {
+    const announcementMessage = prompts.bot_announcement;
+
+    if (!announcementMessage) {
+        console.error("Bot announcement message is not defined in prompts.json.");
+        return;
+    }
+
+    setInterval(() => {
+        sendChatMessage(announcementMessage); // Send the announcement message to the chat
+    }, BOT_ANNOUNCEMENT_INTERVAL);
+}
+
 // Function to get the file name based on the current date
 function getLogFileName() {
     const date = new Date().toLocaleDateString('fr-FR').split('/').join('-'); // Format DD-MM-YYYY
@@ -150,6 +174,61 @@ function logMessage(user, message, response) {
 
     // Add the log entry to the file for the current day
     fs.appendFileSync(logFile, logEntry, 'utf8');
+}
+
+// Cooldown system for users. Prevents spamming by requiring a minimum delay (defined by COOLDOWN_TIME) between messages from the same user.
+function canUserSendMessage(user) {
+    const now = Date.now();
+    if (userCooldowns.has(user) && now - userCooldowns.get(user) < COOLDOWN_TIME) {
+        return false; // User is still in cooldown
+    }
+    userCooldowns.set(user, now); // Update the user's last message timestamp
+    return true;
+}
+
+// Processes messages in the queue one by one. Ensures that messages are handled sequentially to avoid overloading the bot or APIs. Automatically starts processing if the queue is not empty.
+async function processMessageQueue() {
+    if (isProcessingQueue || messageQueue.length === 0) return;
+
+    isProcessingQueue = true;
+
+    while (messageQueue.length > 0) {
+        const { question, sender, messageId } = messageQueue.shift(); // Retrieves the first message from the queue
+        try {
+            await handleBotCommand(question, sender, messageId); // Processes the message
+        } catch (error) {
+            console.error(`Error processing message from ${sender}:`, error);
+        }
+    }
+
+    isProcessingQueue = false;
+}
+
+// Adds a message to the processing queue. Ensures that users respect a cooldown period before sending another message. If a user sends messages too quickly, they are notified to wait before asking again.
+function enqueueMessage(question, sender, messageId) {
+    const now = Date.now();
+    // Check if the user is in cooldown
+    if (!canUserSendMessage(sender)) {
+        console.log(`User ${sender} is sending messages too quickly.`);
+        sendChatMessage(`Patiente un peu avant de poser une autre question, ${sender} !`, messageId);
+        return;
+    }
+
+    // Check if the question is identical and recent
+    if (userLastQuestions.has(sender)) {
+        const { lastQuestion, timestamp } = userLastQuestions.get(sender);
+        if (lastQuestion === question && now - timestamp < QUESTION_EXPIRATION_TIME) {
+            console.log(`User ${sender} asked the same question recently: "${question}"`);
+            sendChatMessage(`You already asked this question recently, ${sender}! 😊`, messageId);
+            return;
+        }
+    }
+
+    // Update the user's last question with a timestamp
+    userLastQuestions.set(sender, { lastQuestion: question, timestamp: now });
+
+    messageQueue.push({ question, sender, messageId });
+    processMessageQueue(); // Starts processing if it is not already in progress
 }
 
 // Handle WebSocket messages
@@ -181,7 +260,7 @@ async function handleWebSocketMessage(message) {
 
                 if (chatMessage.startsWith('!brigadier')) {
                     const question = chatMessage.replace('!brigadier', '').trim();
-                    handleBotCommand(question, sender, messageId);
+                    enqueueMessage(question, sender, messageId);
                 } else if (chatMessage.trim() === '!titre') { // Check for the "!titre" command
                     const streamTitle = await getStreamTitle(); // Fetch the stream title
                     sendChatMessage(`Titre du stream : ${streamTitle}`, messageId); // Send the title as a response
@@ -230,42 +309,85 @@ function truncateMessage(message, maxLength = 500) {
     if (message.length <= maxLength) {
         return message;
     }
-    // Tronquer proprement à la dernière phrase ou mot complet
+    // Truncate and add ellipsis
     return message.slice(0, maxLength).trim() + '...';
 }
 
 // Send a message to the chat
-async function sendChatMessage(message, messageId=null) {
-// Tronquer le message à 500 caractères
-    message = truncateMessage(message);
-    const body = {
-        broadcaster_id: BROADCASTER_ID,
-        sender_id: BROADCASTER_ID, // The ID of the user sending the message
-        message: message,
-    };
+async function sendChatMessage(message, messageId = null) {
+    try {
+        // Truncate the message if it exceeds 500 characters
+        message = truncateMessage(message);
 
-    // If replying to a specific message, add the parent message ID
-    if (messageId) {
-        body.reply_parent_message_id = messageId;
-    }
+        // Prepare the body of the request
+        const body = {
+            broadcaster_id: BROADCASTER_ID,
+            sender_id: BOT_USER_ID,
+            message: message,
+        };
 
-    const response = await fetch('https://api.twitch.tv/helix/chat/messages', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${OAUTH_TOKEN}`,
-            'Client-Id': CLIENT_ID,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
+        // If replying to a specific message, include the parent message ID
+        if (messageId) {
+            body.reply_parent_message_id = messageId;
+        }
 
-    if (!response.ok) {
-        console.error('Error sending the message:', await response.text());
-    } else {
-        console.log('Message sent:', message);
+        // First attempt to send the message
+        const response = await fetch('https://api.twitch.tv/helix/chat/messages', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${OAUTH_TOKEN}`,
+                'Client-Id': CLIENT_ID,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+
+            // If the error is "Unauthorized" (invalid OAuth token)
+            if (response.status === 401 && errorData.message === "Invalid OAuth token") {
+                console.warn('Invalid OAuth token detected. Attempting to refresh...');
+                await refreshAccessToken(); // Refresh the token
+
+                // Retry sending the message with the new token
+                const retryResponse = await fetch('https://api.twitch.tv/helix/chat/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${OAUTH_TOKEN}`,
+                        'Client-Id': CLIENT_ID,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(body),
+                });
+
+                if (!retryResponse.ok) {
+                    console.error('Error sending the message after token refresh:', await retryResponse.text());
+                } else {
+                    console.log('Message sent successfully after token refresh:', message);
+                }
+            } else {
+                console.error('Error sending the message:', errorData);
+            }
+        } else {
+            console.log('Message sent successfully:', message);
+        }
+    } catch (error) {
+        console.error('Unexpected error while sending the message:', error);
     }
 }
 
+/**
+ * Handles a command or question sent to the bot.
+ * Determines the type of question or command and processes it accordingly.
+ * Supports various types of interactions, such as responding to user questions,
+ * providing information about the stream, or handling specific bot commands.
+ * 
+ * @param {string} question - The question or command sent by the user.
+ * @param {string} sender - The username of the person who sent the message.
+ * @param {string} messageId - The ID of the message (used for replying in chat).
+ * @returns {Promise<void>} - Resolves when the command has been processed.
+ */
 async function handleBotCommand(question, sender, messageId) {
     // Checks if the message is empty or contains 3 characters or less
     if (!question || question.trim().length <= 3) {
