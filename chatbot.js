@@ -30,6 +30,8 @@ const pejorativeRegex = new RegExp(`\\b(${pejorativeWords.map(word => word.trim(
 
 // List of prompts for openAI
 const prompts = JSON.parse(fs.readFileSync('prompts.json', 'utf-8'));
+const viewerLanguageFile = 'viewer_language.json';
+let viewerLanguage = JSON.parse(fs.readFileSync(viewerLanguageFile, 'utf-8'));
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
@@ -377,6 +379,21 @@ async function sendChatMessage(message, messageId = null) {
     }
 }
 
+// Function to assign a language to a viewer
+function assignLanguageToViewer(viewer) {
+    if (!viewerLanguage[viewer]) {
+        // Choisir un type de langage aléatoire (représenté par un chiffre)
+        const randomLanguage = Math.floor(Math.random() * 3) + 1; // 1, 2 ou 3
+        viewerLanguage[viewer] = randomLanguage;
+
+        // Sauvegarder dans le fichier JSON
+        fs.writeFileSync(viewerLanguageFile, JSON.stringify(viewerLanguage, null, 2), 'utf-8');
+        console.log(`Assigned language "${randomLanguage}" to viewer "${viewer}".`);
+    }
+
+    return viewerLanguage[viewer];
+}
+
 /**
  * Handles a command or question sent to the bot.
  * Determines the type of question or command and processes it accordingly.
@@ -389,6 +406,10 @@ async function sendChatMessage(message, messageId = null) {
  * @returns {Promise<void>} - Resolves when the command has been processed.
  */
 async function handleBotCommand(question, sender, messageId) {
+    // Assigner un type de langage au viewer s'il n'en a pas déjà un
+    const languageCode = assignLanguageToViewer(sender);
+    const language = prompts.language_styles[languageCode]; // Convertir le code en style de langage
+
     // Checks if the message is empty or contains 3 characters or less
     if (!question || question.trim().length <= 3) {
         const fallbackResponse = "Tu devrais poser une question plus complète ! 😊";
@@ -401,21 +422,21 @@ async function handleBotCommand(question, sender, messageId) {
 
     try {
         if (pejorativeRegex.test(question)) {
-            response = await getOpenAIResponse(question);
+            response = await getOpenAIResponse(question, language);
         } else if (isStreamQuestion(question)) {
             const schedule = await getTwitchSchedule();
-            response = await askOpenAIAboutSchedule(question, schedule);
+            response = await askOpenAIAboutSchedule(question, language, schedule);
         } else if (isChonchQuestion(question)) {
             response = await askOpenAIAboutChonch(question);
-        } else if (isSocialMediaQuestion(question)) {
+        } else if (isSocialMediaQuestion(question, language)) {
             response = await askOpenAIAboutSocials(question);
-        } else if (isSubscriptionQuestion(question)) {
+        } else if (isSubscriptionQuestion(question, language)) {
             response = await askOpenAIAboutSubscription(question);
         } else if (isTopClipsQuestion(question)) {
             const clipsInfo = await getTopClips();
-            response = await askOpenAIAboutClips(question, clipsInfo);
+            response = await askOpenAIAboutClips(question, language, clipsInfo);
         } else {
-            response = await getOpenAIResponse(question);
+            response = await getOpenAIResponse(question, language);
         }
 
         sendChatMessage(response, messageId);
@@ -459,12 +480,24 @@ async function getStreamTitle() {
     }
 }
 
-// Function to get a response from OpenAI
-async function getOpenAIResponse(question) {
-    const prompt = `${prompts.profile}
-    ${prompts.negative}
-    Voici la question du viewer: 
+function buildPrompt(options = {}) {
+    const { profile = prompts.profile, language, question, additionalInfo = '' } = options;
+
+    return `${profile}
+    Le type de langage utilisé pour répondre est : ${language}.
+    ${additionalInfo}
+    Voici la question du viewer : 
     ${question}`;
+}
+
+// Function to get a response from OpenAI
+async function getOpenAIResponse(question, language) {
+    const additionalInfo = prompts.negative;
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const response = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -486,12 +519,13 @@ async function getTwitchSchedule() {
     return data.data.segments || [];
 }
 
-async function askOpenAIAboutSchedule(question, schedule) {
-    const prompt = `${prompts.profile}
-    Voici les horaires de streaming, tu dois convertir les heures en GMT+1:
-    ${JSON.stringify(schedule)}
-    Réponds à cette question à propos du planning en te basant sur ces informations:
-    ${question}`;
+async function askOpenAIAboutSchedule(question, language, schedule) {
+    const additionalInfo = `Voici les horaires de streaming, tu dois convertir les heures en GMT+1: ${JSON.stringify(schedule)}`;
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const openaiResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -508,17 +542,20 @@ function isStreamQuestion(message) {
     return regex.test(message);
 }
 
-async function askOpenAIAboutSocials(question) {
-    const prompt = `${prompts.profile}
-    Voici les liens vers les réseaux sociaux de la chaine:
+async function askOpenAIAboutSocials(question, language) {
+    const additionalInfo = `Voici les liens vers les réseaux sociaux de la chaine:
     Instagram: ${INSTAGRAM_URL}
     YouTube: ${YOUTUBE_URL}
     VOD: ${VOD_URL}
     Tiktok: ${TIKTOK_URL}
     Discord: ${DISCORD_URL}
-    X et twitter: ${X_URL}
-    La question que l'on te pose est la suivante:
-    ${question}`;
+    X et twitter: ${X_URL}`;
+
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const openaiResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -536,16 +573,19 @@ function isSocialMediaQuestion(message) {
 
 // Function to ask OpenAI about subscriptions
 async function askOpenAIAboutSubscription(question) {
-    const prompt = `${prompts.profile} 
-    Voici la question à propos de l'abonnement :  
-    ${question}
+    const additionalInfo = `Voici les avantages de l'abonnement à la chaîne :
+        Essaie de convaincre en quelques mots pourquoi s'abonner à la chaîne. Mentionne les avantages suivants sans en rajouter ni faire de supposition :
+        - De nouveaux emojis exclusifs.
+        - Moins de publicités pendant les streams.
+        - Un soutien direct à la chaîne et au créateur de contenu.
 
-    Essaie de convaincre en quelques mots pourquoi s'abonner à la chaîne. Mentionne les avantages suivants sans en rajouter ni faire de supposition :
-    - De nouveaux emojis exclusifs.
-    - Moins de publicités pendant les streams.
-    - Un soutien direct à la chaîne et au créateur de contenu.
+        Sois persuasif et donne une réponse convaincante !`;
 
-    Sois persuasif et donne une réponse convaincante !`;
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const openaiResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -563,11 +603,14 @@ function isSubscriptionQuestion(message) {
 }
 
 // Function to ask OpenAI about chonch
-async function askOpenAIAboutChonch(question) {
-    const prompt = `${prompts.profile}
-    ${prompts.chonch}
-    Voici la question à propos du chonch :  
-    ${question}`;
+async function askOpenAIAboutChonch(question, language) {
+    additionalInfo = ${prompts.chonch};
+    
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const openaiResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -638,13 +681,15 @@ async function getTopClips() {
 }
 
 // Function to ask OpenAI to format the top clips response
-async function askOpenAIAboutClips(question, clipsInfo) {
-    // console.log("openIA: " + JSON.stringify(clipsInfo, null, 2));
-    const prompt = `${prompts.profile}
-    Voici les 3 clips les plus populaires de la chaîne Twitch :
-    ${JSON.stringify(clipsInfo)}
-    Et voici la question de l'utilisateur:
-    ${question}`;
+async function askOpenAIAboutClips(question, clipsInfo, language) {
+    additionalInfo = `Voici les 3 clips les plus populaires de la chaîne Twitch :
+    ${JSON.stringify(clipsInfo)}`;
+
+    const prompt = buildPrompt({
+        language,
+        question,
+        additionalInfo
+    });
 
     const openaiResponse = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
