@@ -136,7 +136,7 @@ function startWebSocketConnection(url = EVENTSUB_WEBSOCKET_URL) {
         }, 5000); // Wait 5 sec
     });
 
-    // Ajouter un gestionnaire pour les pongs
+    // Add a handler for pongs
     ws.on('pong', () => {
         console.log('Pong received.');
     });
@@ -162,9 +162,9 @@ function getLogFileName() {
 }
 
 // Function to add a log entry to logs.txt
-function logMessage(user, message, response) {
+function logMessage(user, message, condition, response) {
     const timestamp = new Date().toLocaleString(); // Readable format
-    const logEntry = `[${timestamp}] ${user}: ${message} \nBOT: ${response}\n\n`;
+    const logEntry = `[${timestamp}] ${user}: ${message}\n${condition}\nBOT: ${response}\n\n`;
 
     // Get the file for the current day
     const logFile = getLogFileName();
@@ -382,11 +382,11 @@ async function sendChatMessage(message, messageId = null) {
 // Function to assign a language to a viewer
 function assignLanguageToViewer(viewer) {
     if (!viewerLanguage[viewer]) {
-        // Choisir un type de langage aléatoire (représenté par un chiffre)
-        const randomLanguage = Math.floor(Math.random() * 3) + 1; // 1, 2 ou 3
+        // Choose a random language type (represented by a number)
+        const randomLanguage = Math.floor(Math.random() * 3) + 1; // 1, 2 or 3
         viewerLanguage[viewer] = randomLanguage;
 
-        // Sauvegarder dans le fichier JSON
+        // Save the viewer language to the JSON file
         fs.writeFileSync(viewerLanguageFile, JSON.stringify(viewerLanguage, null, 2), 'utf-8');
         console.log(`Assigned language "${randomLanguage}" to viewer "${viewer}".`);
     }
@@ -406,7 +406,7 @@ function assignLanguageToViewer(viewer) {
  * @returns {Promise<void>} - Resolves when the command has been processed.
  */
 async function handleBotCommand(question, sender, messageId) {
-    // Assigner un type de langage au viewer s'il n'en a pas déjà un
+    // Assign a language to the viewer if not already assigned
     const languageCode = assignLanguageToViewer(sender);
     const language = prompts.language_styles[languageCode]; // Convertir le code en style de langage
 
@@ -419,28 +419,36 @@ async function handleBotCommand(question, sender, messageId) {
     }
 
     let response;
+    let condition;
 
     try {
         if (pejorativeRegex.test(question)) {
             response = await getOpenAIResponse(question, language);
+            condition = "Question péjorative détectée";
         } else if (isStreamQuestion(question)) {
             const schedule = await getTwitchSchedule();
             response = await askOpenAIAboutSchedule(question, language, schedule);
+            condition = "Question sur le programme de stream";
         } else if (isChonchQuestion(question)) {
-            response = await askOpenAIAboutChonch(question);
-        } else if (isSocialMediaQuestion(question, language)) {
-            response = await askOpenAIAboutSocials(question);
-        } else if (isSubscriptionQuestion(question, language)) {
-            response = await askOpenAIAboutSubscription(question);
+            response = await askOpenAIAboutChonch(question, language);
+            condition = "Question sur 'chonch";
+        } else if (isSocialMediaQuestion(question)) {
+            response = await askOpenAIAboutSocials(question, language);
+            condition = "Question sur les réseaux sociaux";
+        } else if (isSubscriptionQuestion(question)) {
+            response = await askOpenAIAboutSubscription(question, language);
+            condition = "Question sur les abonnements";
         } else if (isTopClipsQuestion(question)) {
             const clipsInfo = await getTopClips();
             response = await askOpenAIAboutClips(question, language, clipsInfo);
+            condition = "Question sur les clips populaires";
         } else {
             response = await getOpenAIResponse(question, language);
+            condition = "Question générale";
         }
 
         sendChatMessage(response, messageId);
-        logMessage(sender, question, response);
+        logMessage(sender, question, `Condition: ${condition} `, response);
 
     } catch (error) {
         console.error("Error in handleBotCommand:", error);
@@ -491,8 +499,9 @@ function buildPrompt(options = {}) {
 }
 
 // Function to get a response from OpenAI
-async function getOpenAIResponse(question, language) {
-    const additionalInfo = prompts.negative;
+async function getOpenAIResponse(language, question) {
+    const additionalInfo = `${prompts.negative}`;
+
     const prompt = buildPrompt({
         language,
         question,
@@ -519,7 +528,7 @@ async function getTwitchSchedule() {
     return data.data.segments || [];
 }
 
-async function askOpenAIAboutSchedule(question, language, schedule) {
+async function askOpenAIAboutSchedule(language, question, schedule) {
     const additionalInfo = `Voici les horaires de streaming, tu dois convertir les heures en GMT+1: ${JSON.stringify(schedule)}`;
     const prompt = buildPrompt({
         language,
@@ -572,13 +581,13 @@ function isSocialMediaQuestion(message) {
 }
 
 // Function to ask OpenAI about subscriptions
-async function askOpenAIAboutSubscription(question) {
+async function askOpenAIAboutSubscription(language, question) {
     const additionalInfo = `Voici les avantages de l'abonnement à la chaîne :
         Essaie de convaincre en quelques mots pourquoi s'abonner à la chaîne. Mentionne les avantages suivants sans en rajouter ni faire de supposition :
         - De nouveaux emojis exclusifs.
         - Moins de publicités pendant les streams.
         - Un soutien direct à la chaîne et au créateur de contenu.
-
+        Le prix de l'abonnement est de 4.99€, et il est possible d'offrir un abonnement à un autre utilisateur.
         Sois persuasif et donne une réponse convaincante !`;
 
     const prompt = buildPrompt({
@@ -603,8 +612,8 @@ function isSubscriptionQuestion(message) {
 }
 
 // Function to ask OpenAI about chonch
-async function askOpenAIAboutChonch(question, language) {
-    additionalInfo = ${prompts.chonch};
+async function askOpenAIAboutChonch(language, question, additionalInfo) {
+    additionalInfo = `${prompts.chonch}`;
     
     const prompt = buildPrompt({
         language,
